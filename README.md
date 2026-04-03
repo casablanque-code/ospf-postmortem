@@ -4,7 +4,6 @@ A browser-based OSPF analyzer for network engineers. Drop a PCAP file — get a 
 
 Built in Rust compiled to WebAssembly. No server, no backend, no Node.js.
 
-![OSPF Post-Mortem screenshot](docs/screenshot.png)
 
 **Live demo: https://ospf-postmortem.casablanque.workers.dev**
 
@@ -187,7 +186,6 @@ make clean   # remove artifacts
 
 ## Limitations
 
-- Legacy PCAP only — PCAPng not yet supported
 - Ethernet link type only
 - FSM reconstruction is approximate — inferred from packet evidence, not router internals
 - Large captures (>100MB) may be slow
@@ -199,7 +197,6 @@ make clean   # remove artifacts
 
 - [ ] Topology graph — reconstruct network diagram from Router-LSA data
 - [ ] HSRP detection (UDP 1985) — Coup/Resign, rogue active, priority wars
-- [ ] PCAPng support
 - [ ] FSM Full state via LSAck tracking
 - [ ] Convergence time measurement
 

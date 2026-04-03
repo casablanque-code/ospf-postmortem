@@ -1,6 +1,7 @@
 #![allow(dead_code, unused_imports, unused_variables)]
 
 mod pcap;
+mod pcapng;
 mod net;
 mod ospf;
 mod analyzer;
@@ -22,25 +23,38 @@ macro_rules! console_log {
 
 #[wasm_bindgen]
 pub fn analyze_pcap(data: &[u8]) -> Result<JsValue, JsValue> {
-    let (_, packets) = pcap::iter_packets(data)
-        .map_err(|e| JsValue::from_str(&e))?;
+    // Автодетект формата: PCAPng magic = 0x0A0D0D0A, legacy PCAP = 0xa1b2c3d4 / 0xd4c3b2a1
+    let is_pcapng = data.len() >= 4 && 
+        u32::from_le_bytes([data[0], data[1], data[2], data[3]]) == 0x0A0D0D0Au32;
 
-    console_log!("PCAP parsed: {} packets", packets.len());
+    // Унифицированный список пакетов: (ts_sec, ts_usec, data)
+    let unified: Vec<(u32, u32, Vec<u8>)> = if is_pcapng {
+        console_log!("Detected PCAPng format");
+        pcapng::parse_pcapng(data)
+            .map_err(|e| JsValue::from_str(&e))?
+    } else {
+        console_log!("Detected legacy PCAP format");
+        let (_, pkts) = pcap::iter_packets(data)
+            .map_err(|e| JsValue::from_str(&e))?;
+        pkts.iter().map(|p| (p.ts_sec, p.ts_usec, p.data.to_vec())).collect()
+    };
+
+    console_log!("Parsed: {} packets", unified.len());
 
     let mut analyzer = Analyzer::new();
     let mut events: Vec<TimedEvent> = Vec::new();
     let mut ospf_count = 0usize;
     let mut last_ts = analyzer::Timestamp { sec: 0, usec: 0 };
 
-    let first_ts = packets.first()
-        .map(|p| p.ts_sec as f64 + p.ts_usec as f64 / 1e6)
+    let first_ts = unified.first()
+        .map(|(s, u, _)| *s as f64 + *u as f64 / 1e6)
         .unwrap_or(0.0);
 
-    for pkt in &packets {
-        let ts = analyzer::Timestamp { sec: pkt.ts_sec, usec: pkt.ts_usec };
+    for (ts_sec, ts_usec, pkt_data) in &unified {
+        let ts = analyzer::Timestamp { sec: *ts_sec, usec: *ts_usec };
         last_ts = ts;
 
-        let Some((ip, payload)) = net::extract_ip(pkt.data) else { continue };
+        let Some((ip, payload)) = net::extract_ip(pkt_data) else { continue };
         if ip.protocol != PROTO_OSPF { continue; }
 
         let Some(ospf_pkt) = ospf::parse_ospf(payload) else { continue };
@@ -83,7 +97,7 @@ pub fn analyze_pcap(data: &[u8]) -> Result<JsValue, JsValue> {
     };
 
     let report = FullReport {
-        total_packets: packets.len(),
+        total_packets: unified.len(),
         ospf_packets: ospf_count,
         duration_sec: last_ts.to_f64() - first_ts,
         events,
