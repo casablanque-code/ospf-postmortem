@@ -63,7 +63,8 @@ pub fn analyze_pcap(data: &[u8]) -> Result<JsValue, JsValue> {
     }
 
     // Root cause correlation
-    let root_cause_report = root_cause::correlate(&events);
+    let mtu_counts = analyzer.mtu_mismatch_counts().clone();
+    let root_cause_report = root_cause::correlate(&events, &mtu_counts);
 
     let anomalies        = events.iter().filter(|e| matches!(e.severity, analyzer::Severity::Warning | analyzer::Severity::Critical)).count();
     let neighbor_timeouts = events.iter().filter(|e| matches!(e.event, analyzer::OspfEvent::NeighborTimeout { .. })).count();

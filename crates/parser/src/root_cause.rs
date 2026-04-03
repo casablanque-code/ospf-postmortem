@@ -61,6 +61,31 @@ pub struct RootCause {
     /// Временной диапазон
     pub first_seen: f64,
     pub last_seen: f64,
+    /// Уверенность детектора 0-100
+    pub confidence: u8,
+    /// Причина уверенности — что именно её повышает/понижает
+    pub confidence_reason: String,
+    /// Причинно-следственная цепочка событий во времени
+    pub causal_chain: Vec<ChainStep>,
+}
+
+/// Один шаг в причинно-следственной цепочке
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainStep {
+    pub ts: f64,
+    pub event_type: String,
+    pub description: String,
+    pub role: ChainRole,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ChainRole {
+    /// Первопричина
+    Cause,
+    /// Прямое следствие
+    Effect,
+    /// Фоновый шум (нормальные события вокруг инцидента)
+    Context,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
@@ -96,11 +121,11 @@ pub struct RootCauseReport {
 
 // ── Correlator ───────────────────────────────────────────────────────────────
 
-pub fn correlate(events: &[TimedEvent]) -> RootCauseReport {
+pub fn correlate(events: &[TimedEvent], mtu_counts: &std::collections::HashMap<String, u8>) -> RootCauseReport {
     let mut causes: Vec<RootCause> = Vec::new();
 
     // Каждый детектор независим — смотрит на весь список событий
-    if let Some(c) = detect_mtu_mismatch(events)         { causes.push(c); }
+    if let Some(c) = detect_mtu_mismatch(events, mtu_counts) { causes.push(c); }
     if let Some(c) = detect_hello_mismatch(events)       { causes.push(c); }
     if let Some(c) = detect_duplicate_rid(events)        { causes.push(c); }
     if let Some(c) = detect_auth_mismatch(events)        { causes.push(c); }
@@ -127,6 +152,9 @@ pub fn correlate(events: &[TimedEvent]) -> RootCauseReport {
             affected_routers: Vec::new(),
             first_seen: 0.0,
             last_seen: 0.0,
+            confidence: 90,
+            confidence_reason: "No anomalous patterns detected across full capture window.".into(),
+            causal_chain: Vec::new(),
         });
     }
 
@@ -135,12 +163,15 @@ pub fn correlate(events: &[TimedEvent]) -> RootCauseReport {
 
 // ── Детекторы ─────────────────────────────────────────────────────────────────
 
-fn detect_mtu_mismatch(events: &[TimedEvent]) -> Option<RootCause> {
+fn detect_mtu_mismatch(events: &[TimedEvent], mtu_counts: &std::collections::HashMap<String, u8>) -> Option<RootCause> {
     let mismatches: Vec<_> = events.iter().filter(|e|
         matches!(e.event, OspfEvent::MtuMismatch { .. })
     ).collect();
 
     if mismatches.is_empty() { return None; }
+
+    // Считаем все DBD события для confidence (до дедупа по router_id)
+    let all_mtu_events = mismatches.len();
 
     let mut routers = Vec::new();
     let mut evidence = Vec::new();
@@ -187,6 +218,60 @@ fn detect_mtu_mismatch(events: &[TimedEvent]) -> Option<RootCause> {
         secondary.push("Adjacency never formed — DBD exchange stuck in ExStart/Exchange state".into());
     }
 
+    // Берём реальный count DBD пакетов из analyzer
+    let total_dbd = mismatches.iter().map(|te| {
+        if let OspfEvent::MtuMismatch { router_id, .. } = &te.event {
+            *mtu_counts.get(router_id).unwrap_or(&1) as usize
+        } else { 1 }
+    }).sum::<usize>();
+
+    let confidence = (70u8 + (total_dbd as u8).saturating_sub(1) * 5).min(99);
+    let confidence_reason = format!(
+        "{} DBD packet(s) with mismatched MTU observed. {} retransmission(s) confirm stalled ExStart.",
+        total_dbd,
+        total_dbd.saturating_sub(1)
+    );
+
+    // Causal chain
+    let mut chain: Vec<ChainStep> = Vec::new();
+    // Контекст: первые Hello
+    if let Some(first_ev) = events.iter().find(|e| matches!(e.event, OspfEvent::NeighborDiscovered { .. })) {
+        chain.push(ChainStep {
+            ts: first_ev.ts,
+            event_type: "NeighborDiscovered".into(),
+            description: "Neighbor discovered, Hello exchange successful".into(),
+            role: ChainRole::Context,
+        });
+    }
+    // Причина: первый MTU mismatch
+    chain.push(ChainStep {
+        ts: mismatches[0].ts,
+        event_type: "MtuMismatch".into(),
+        description: format!("MTU mismatch detected in DBD — {} vs {}", 
+            if let OspfEvent::MtuMismatch { mtu, .. } = &mismatches[0].event { mtu.to_string() } else { "?".into() },
+            if let OspfEvent::MtuMismatch { expected_mtu, .. } = &mismatches[0].event { expected_mtu.to_string() } else { "?".into() }
+        ),
+        role: ChainRole::Cause,
+    });
+    // Следствия
+    for te in events.iter().filter(|e| e.ts >= mismatches[0].ts && matches!(e.event, OspfEvent::NeighborTimeout { .. })) {
+        chain.push(ChainStep {
+            ts: te.ts,
+            event_type: "NeighborTimeout".into(),
+            description: "Adjacency timed out — DBD never completed".into(),
+            role: ChainRole::Effect,
+        });
+    }
+    if !adj_formed {
+        chain.push(ChainStep {
+            ts: mismatches.last().unwrap().ts + 1.0,
+            event_type: "AdjacencyFailed".into(),
+            description: "Adjacency never reached Full state".into(),
+            role: ChainRole::Effect,
+        });
+    }
+    chain.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
+
     Some(RootCause {
         kind: RootCauseKind::MtuMismatch,
         severity: RootCauseSeverity::Critical,
@@ -198,6 +283,9 @@ fn detect_mtu_mismatch(events: &[TimedEvent]) -> Option<RootCause> {
         affected_routers: routers,
         first_seen: mismatches[0].ts,
         last_seen: mismatches.last().unwrap().ts,
+        confidence,
+        confidence_reason,
+        causal_chain: chain,
     })
 }
 
@@ -227,6 +315,27 @@ fn detect_hello_mismatch(events: &[TimedEvent]) -> Option<RootCause> {
 
     let routers: Vec<_> = routers.into_iter().collect();
 
+    let confidence = 97u8; // RFC 2328 однозначен — mismatched timers = adjacency never forms
+    let confidence_reason = format!(
+        "Hello interval mismatch is deterministic per RFC 2328 §10.5. Observed {} packet(s) confirming the discrepancy.",
+        mismatches.len()
+    );
+
+    let chain = vec![
+        ChainStep {
+            ts: mismatches[0].ts,
+            event_type: "HelloIntervalMismatch".into(),
+            description: details.join("; "),
+            role: ChainRole::Cause,
+        },
+        ChainStep {
+            ts: mismatches[0].ts + 1.0,
+            event_type: "AdjacencyFailed".into(),
+            description: "Adjacency permanently stuck in Init — Hello packets silently discarded".into(),
+            role: ChainRole::Effect,
+        },
+    ];
+
     Some(RootCause {
         kind: RootCauseKind::HelloTimerMismatch,
         severity: RootCauseSeverity::Critical,
@@ -241,6 +350,9 @@ fn detect_hello_mismatch(events: &[TimedEvent]) -> Option<RootCause> {
         affected_routers: routers,
         first_seen: mismatches[0].ts,
         last_seen: mismatches.last().unwrap().ts,
+        confidence,
+        confidence_reason,
+        causal_chain: chain,
     })
 }
 
@@ -265,6 +377,24 @@ fn detect_duplicate_rid(events: &[TimedEvent]) -> Option<RootCause> {
         }
     }
 
+    let confidence = 99u8;
+    let confidence_reason = "Same Router-ID observed from two distinct source IPs. This is unambiguous — Router-IDs must be globally unique within an OSPF domain.".into();
+
+    let chain = vec![
+        ChainStep {
+            ts: dups[0].ts,
+            event_type: "DuplicateRouterId".into(),
+            description: format!("RID {} seen from multiple IPs simultaneously", routers.join(", ")),
+            role: ChainRole::Cause,
+        },
+        ChainStep {
+            ts: dups[0].ts + 0.5,
+            event_type: "LsdbCorruption".into(),
+            description: "Conflicting Router-LSAs flooding the area — LSDB corrupted".into(),
+            role: ChainRole::Effect,
+        },
+    ];
+
     Some(RootCause {
         kind: RootCauseKind::DuplicateRouterId,
         severity: RootCauseSeverity::Critical,
@@ -280,6 +410,9 @@ fn detect_duplicate_rid(events: &[TimedEvent]) -> Option<RootCause> {
         affected_routers: routers,
         first_seen: dups[0].ts,
         last_seen: dups.last().unwrap().ts,
+        confidence,
+        confidence_reason,
+        causal_chain: chain,
     })
 }
 
@@ -309,6 +442,24 @@ fn detect_auth_mismatch(events: &[TimedEvent]) -> Option<RootCause> {
         }
     }
 
+    let confidence = 95u8;
+    let confidence_reason = "Authentication type field in OSPF common header is unambiguous. Mismatch guarantees packet rejection per RFC 2328 §D.3.".into();
+
+    let chain = vec![
+        ChainStep {
+            ts: mismatches[0].ts,
+            event_type: "AuthMismatch".into(),
+            description: "Conflicting auth types observed in Hello packets".into(),
+            role: ChainRole::Cause,
+        },
+        ChainStep {
+            ts: mismatches[0].ts + 1.0,
+            event_type: "AdjacencyFailed".into(),
+            description: "Packets silently dropped — no adjacency possible".into(),
+            role: ChainRole::Effect,
+        },
+    ];
+
     Some(RootCause {
         kind: RootCauseKind::AuthenticationMismatch,
         severity: RootCauseSeverity::Critical,
@@ -323,6 +474,9 @@ fn detect_auth_mismatch(events: &[TimedEvent]) -> Option<RootCause> {
         affected_routers: routers,
         first_seen: mismatches[0].ts,
         last_seen: mismatches.last().unwrap().ts,
+        confidence,
+        confidence_reason,
+        causal_chain: chain,
     })
 }
 
@@ -373,6 +527,25 @@ fn detect_neighbor_flapping(events: &[TimedEvent]) -> Option<RootCause> {
 
     evidence.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
 
+    let flap_count = flapping.len();
+    let confidence = (60u8 + (flap_count as u8) * 15).min(95);
+    let confidence_reason = format!(
+        "{} router(s) with repeated up/down cycles detected. {} cycle(s) observed — higher cycle count increases confidence.",
+        flap_count, flap_count
+    );
+
+    let mut chain: Vec<ChainStep> = evidence.iter().map(|ev| ChainStep {
+        ts: ev.ts,
+        event_type: ev.event_type.clone(),
+        description: ev.description.clone(),
+        role: if ev.event_type == "NeighborDiscovered" { ChainRole::Context } else { ChainRole::Effect },
+    }).collect();
+    // Первый down — причина
+    if let Some(first_down) = chain.iter_mut().find(|s| s.event_type == "NeighborTimeout") {
+        first_down.role = ChainRole::Cause;
+    }
+    chain.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
+
     Some(RootCause {
         kind: RootCauseKind::NeighborFlapping,
         severity: RootCauseSeverity::Warning,
@@ -388,6 +561,9 @@ fn detect_neighbor_flapping(events: &[TimedEvent]) -> Option<RootCause> {
         affected_routers: routers,
         first_seen: first_ts,
         last_seen: last_ts,
+        confidence,
+        confidence_reason,
+        causal_chain: chain,
     })
 }
 
@@ -414,6 +590,19 @@ fn detect_dr_instability(events: &[TimedEvent]) -> Option<RootCause> {
 
     let areas: Vec<_> = areas.into_iter().collect();
 
+    let confidence = (50u8 + (dr_changes.len() as u8) * 10).min(90);
+    let confidence_reason = format!(
+        "{} DR change(s) observed. Single DR change at startup is normal — repeated changes indicate instability.",
+        dr_changes.len()
+    );
+
+    let chain = evidence.iter().map(|ev| ChainStep {
+        ts: ev.ts,
+        event_type: ev.event_type.clone(),
+        description: ev.description.clone(),
+        role: if ev.ts == dr_changes[0].ts { ChainRole::Cause } else { ChainRole::Effect },
+    }).collect();
+
     Some(RootCause {
         kind: RootCauseKind::DrInstability,
         severity: RootCauseSeverity::Warning,
@@ -428,6 +617,9 @@ fn detect_dr_instability(events: &[TimedEvent]) -> Option<RootCause> {
         affected_routers: areas,
         first_seen: dr_changes[0].ts,
         last_seen: dr_changes.last().unwrap().ts,
+        confidence,
+        confidence_reason,
+        causal_chain: chain,
     })
 }
 
@@ -455,6 +647,19 @@ fn detect_topology_instability(events: &[TimedEvent]) -> Option<RootCause> {
         }
     }
 
+    let confidence = if total_lsu > 20 { 85u8 } else if total_lsu > 10 { 70 } else { 55 };
+    let confidence_reason = format!(
+        "{} LSUs observed across {} flood window(s). Threshold: >10 LSUs/5s. Higher LSU count = higher confidence this is genuine instability vs normal convergence.",
+        total_lsu, floods.len()
+    );
+
+    let chain = evidence.iter().map(|ev| ChainStep {
+        ts: ev.ts,
+        event_type: ev.event_type.clone(),
+        description: ev.description.clone(),
+        role: if ev.ts == floods[0].ts { ChainRole::Cause } else { ChainRole::Effect },
+    }).collect();
+
     Some(RootCause {
         kind: RootCauseKind::TopologyInstability,
         severity: RootCauseSeverity::Warning,
@@ -469,6 +674,9 @@ fn detect_topology_instability(events: &[TimedEvent]) -> Option<RootCause> {
         affected_routers: routers,
         first_seen: floods[0].ts,
         last_seen: floods.last().unwrap().ts,
+        confidence,
+        confidence_reason,
+        causal_chain: chain,
     })
 }
 

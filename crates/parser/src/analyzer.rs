@@ -180,7 +180,7 @@ pub struct Analyzer {
     lsu_tracker: HashMap<String, LsuTracker>,
     /// LSU flood threshold (пакетов за 5 секунд)
     lsu_flood_threshold: usize,
-    mtu_mismatch_seen: std::collections::HashSet<String>,
+    mtu_mismatch_count: std::collections::HashMap<String, u8>,
     auth_mismatch_seen: std::collections::HashSet<String>,
 }
 
@@ -194,7 +194,7 @@ impl Analyzer {
             known_dr: HashMap::new(),
             lsu_tracker: HashMap::new(),
             lsu_flood_threshold: 10,
-            mtu_mismatch_seen: std::collections::HashSet::new(),
+            mtu_mismatch_count: std::collections::HashMap::new(),
             auth_mismatch_seen: std::collections::HashSet::new(),
         }
     }
@@ -404,8 +404,10 @@ impl Analyzer {
                     nb.dbd_mtu = Some(mtu);
                 }
             }
-            Some(expected) if expected != mtu && mtu != 0 && !self.mtu_mismatch_seen.contains(rid) => {
-                self.mtu_mismatch_seen.insert(rid.to_string());
+            Some(expected) if expected != mtu && mtu != 0 => {
+                let count = self.mtu_mismatch_count.entry(rid.to_string()).or_insert(0);
+                *count += 1;
+                if *count == 1 {
                 events.push(OspfEvent::MtuMismatch {
                     ts: ts.to_f64(),
                     router_id: rid.to_string(),
@@ -414,6 +416,7 @@ impl Analyzer {
                     mtu,
                     expected_mtu: expected,
                 });
+                } // end if count == 1
             }
             _ => {}
         }
@@ -455,6 +458,11 @@ impl Analyzer {
                 });
             }
         }
+    }
+
+    /// Возвращает количество MTU mismatch DBD пакетов per router_id
+    pub fn mtu_mismatch_counts(&self) -> &std::collections::HashMap<String, u8> {
+        &self.mtu_mismatch_count
     }
 
     /// Вызываем в конце — проверяем таймауты соседей

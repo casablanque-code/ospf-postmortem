@@ -171,6 +171,87 @@ h1 span { color: var(--accent); }
 .action-plan li { padding: 5px 0; font-size: 12px; color: var(--text); border-bottom: 1px solid var(--border); }
 .action-plan li:last-child { border-bottom: none; }
 
+/* ── confidence ── */
+.confidence-bar-wrap {
+  margin-top: 14px;
+}
+.confidence-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+.confidence-label { font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); }
+.confidence-value { font-size: 13px; font-weight: 700; font-family: var(--display); }
+.confidence-value.high   { color: var(--ok); }
+.confidence-value.medium { color: var(--warn); }
+.confidence-value.low    { color: var(--muted); }
+.confidence-track {
+  height: 4px;
+  background: var(--border2);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.confidence-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.6s ease;
+}
+.confidence-fill.high   { background: var(--ok); }
+.confidence-fill.medium { background: var(--warn); }
+.confidence-fill.low    { background: var(--muted); }
+.confidence-reason { font-size: 11px; color: var(--muted); margin-top: 5px; line-height: 1.5; }
+
+/* ── causal chain ── */
+.causal-chain {
+  margin-top: 14px;
+}
+.chain-list {
+  list-style: none;
+  padding: 0;
+  position: relative;
+  padding-left: 20px;
+}
+.chain-list::before {
+  content: '';
+  position: absolute;
+  left: 6px; top: 8px; bottom: 8px;
+  width: 1px;
+  background: var(--border2);
+}
+.chain-item {
+  position: relative;
+  padding: 5px 0 5px 12px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.chain-item::before {
+  content: '';
+  position: absolute;
+  left: -14px;
+  top: 10px;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  border: 1px solid var(--border2);
+}
+.chain-item.cause::before   { background: var(--crit); border-color: var(--crit); box-shadow: 0 0 4px rgba(255,68,68,0.4); }
+.chain-item.effect::before  { background: var(--warn); border-color: var(--warn); }
+.chain-item.context::before { background: var(--info); border-color: var(--info); }
+.chain-ts   { color: var(--muted); margin-right: 8px; }
+.chain-role {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 1px 5px;
+  border-radius: 2px;
+  margin-right: 6px;
+}
+.chain-role.cause   { background: rgba(255,68,68,0.15); color: var(--crit); }
+.chain-role.effect  { background: rgba(255,170,0,0.12); color: var(--warn); }
+.chain-role.context { background: rgba(102,136,170,0.12); color: var(--info); }
+.chain-desc { color: var(--text); }
+
 /* ── TIMELINE ── */
 .filter-bar { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
 .filter-btn { font-family: var(--mono); font-size: 11px; padding: 5px 12px; border-radius: 2px; border: 1px solid var(--border2); background: transparent; color: var(--muted); cursor: pointer; transition: all 0.15s; letter-spacing: 0.05em; }
@@ -372,6 +453,40 @@ function renderRootCause(rc) {
            </li>`).join('')}</ul></div>`
       : '';
 
+    // Confidence bar
+    const conf = cause.confidence ?? 0;
+    const confCls = conf >= 85 ? 'high' : conf >= 60 ? 'medium' : 'low';
+    const confLabel = conf >= 85 ? 'High confidence' : conf >= 60 ? 'Medium confidence' : 'Low confidence';
+    const confidenceHtml = `
+    <div class="confidence-bar-wrap">
+      <div class="confidence-header">
+        <span class="confidence-label">Detection Confidence</span>
+        <span class="confidence-value ${confCls}">${conf}% — ${confLabel}</span>
+      </div>
+      <div class="confidence-track">
+        <div class="confidence-fill ${confCls}" style="width:${conf}%"></div>
+      </div>
+      ${cause.confidence_reason ? `<div class="confidence-reason">${cause.confidence_reason}</div>` : ''}
+    </div>`;
+
+    // Causal chain
+    const chainHtml = cause.causal_chain?.length
+      ? `<div class="causal-chain">
+          <div class="rc-block-title" style="margin-bottom:8px">Causal Chain</div>
+          <ul class="chain-list">${cause.causal_chain.map(step => {
+            const role = step.role?.toLowerCase() ?? 'context';
+            const chainBase = cause.causal_chain[0]?.ts ?? step.ts;
+            const rel = step.ts - chainBase;
+            const relStr = rel >= 0 ? `+${rel.toFixed(1)}s` : `${rel.toFixed(1)}s`;
+            return `<li class="chain-item ${role}">
+              <span class="chain-ts">${relStr}</span>
+              <span class="chain-role ${role}">${role}</span>
+              <span class="chain-desc">${step.description}</span>
+            </li>`;
+          }).join('')}</ul>
+        </div>`
+      : '';
+
     const affectedHtml = cause.affected_routers.length
       ? `<div class="rc-block"><div class="rc-block-title">Affected</div>
          <div style="font-size:12px;color:var(--text)">${cause.affected_routers.join(', ')}</div></div>`
@@ -385,6 +500,8 @@ function renderRootCause(rc) {
         <span class="rc-chevron">▼</span>
       </div>
       <div class="rc-body">
+        ${confidenceHtml}
+        ${chainHtml}
         <div class="rc-block"><div class="rc-block-title">Impact</div>
           <div class="rc-impact">${cause.impact}</div></div>
         ${secondaryHtml}
