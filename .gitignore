@@ -3,7 +3,7 @@ target/
 crates/parser/target/
 
 # WASM generated files (regenerate with make build)
-web/pkg/
+
 
 # Python
 __pycache__/
