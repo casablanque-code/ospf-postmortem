@@ -6,6 +6,8 @@ Built in Rust compiled to WebAssembly. No server, no backend, no Node.js.
 
 ![OSPF Post-Mortem screenshot](docs/screenshot.png)
 
+**Live demo: https://ospf-postmortem.emergency-radar.workers.dev**
+
 ---
 
 ## The problem this solves
