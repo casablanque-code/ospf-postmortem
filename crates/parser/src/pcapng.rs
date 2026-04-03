@@ -89,10 +89,20 @@ pub fn parse_pcapng(data: &[u8]) -> Result<Vec<(u32, u32, Vec<u8>)>, String> {
     let mut packets: Vec<(u32, u32, Vec<u8>)> = Vec::new();
 
     while pos + 8 <= data.len() {
+        // block_type читаем с текущим endianness
+        // SHB (0x0A0D0D0A) одинаков в обоих порядках — безопасно
         let block_type = read_u32(data, pos, big_endian)
             .ok_or("Failed to read block type")?;
-        let block_len = read_u32(data, pos + 4, big_endian)
+        // block_len читаем с текущим endianness
+        // Для SHB endianness ещё не определён — читаем LE, потом корректируем
+        let block_len_raw = read_u32(data, pos + 4, false)
             .ok_or("Failed to read block length")?;
+        let block_len = if block_type == BLOCK_SHB {
+            block_len_raw // SHB всегда читаем LE до определения BOM
+        } else {
+            read_u32(data, pos + 4, big_endian)
+                .ok_or("Failed to read block length")?
+        };
 
         if block_len < 12 || pos + block_len as usize > data.len() {
             break;

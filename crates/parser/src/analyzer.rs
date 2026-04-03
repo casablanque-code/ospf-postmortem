@@ -182,6 +182,7 @@ pub struct Analyzer {
     lsu_flood_threshold: usize,
     mtu_mismatch_count: std::collections::HashMap<String, u8>,
     auth_mismatch_seen: std::collections::HashSet<String>,
+    adjacency_formed: std::collections::HashSet<String>,
 }
 
 impl Analyzer {
@@ -195,6 +196,7 @@ impl Analyzer {
             lsu_tracker: HashMap::new(),
             lsu_flood_threshold: 10,
             mtu_mismatch_count: std::collections::HashMap::new(),
+            adjacency_formed: std::collections::HashSet::new(),
             auth_mismatch_seen: std::collections::HashSet::new(),
         }
     }
@@ -220,12 +222,20 @@ impl Analyzer {
                             .find(|(rid, _)| *rid != &self_rid)
                             .map(|(rid, _)| rid.clone())
                             .unwrap_or_else(|| dst_ip.to_string());
-                        events.push(OspfEvent::AdjacencyFormed {
-                            ts: ts.to_f64(),
-                            router_id: self_rid,
-                            neighbor_id: peer_rid,
-                            area,
-                        });
+                        let pair_key = {
+                            let mut pair = vec![self_rid.clone(), peer_rid.clone()];
+                            pair.sort();
+                            pair.join("-")
+                        };
+                        if !self.adjacency_formed.contains(&pair_key) {
+                            self.adjacency_formed.insert(pair_key);
+                            events.push(OspfEvent::AdjacencyFormed {
+                                ts: ts.to_f64(),
+                                router_id: self_rid,
+                                neighbor_id: peer_rid,
+                                area,
+                            });
+                        }
                     }
                 }
             }
