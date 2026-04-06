@@ -1,9 +1,8 @@
 # OSPF Post-Mortem
 
-A browser-based OSPF analyzer for network engineers. Drop a PCAP file — get a structured event timeline, FSM state reconstruction, root cause analysis with remediation steps, and zero data leaving your machine.
+A browser-based OSPF analyzer for network engineers. Drop a PCAP file — get a structured event timeline, full FSM reconstruction, root cause analysis with causal chains, topology graph, and zero data leaving your machine.
 
 Built in Rust compiled to WebAssembly. No server, no backend, no Node.js.
-
 
 **Live demo: https://ospf-postmortem.casablanque.workers.dev**
 
@@ -21,79 +20,89 @@ This tool reconstructs what actually happened: which router entered which FSM st
 
 ## What it does
 
-Parses legacy PCAP captures and reconstructs the OSPF event timeline from raw packets. Tracks neighbor state machines across the full capture and correlates events into root causes.
+### Full FSM Reconstruction
 
-### Detected events
+Reconstructs the complete RFC 2328 neighbor state machine from packet evidence:
 
-| Event | Severity | Description |
-|---|---|---|
-| Neighbor Up | Info | New router-ID seen, adjacency starting |
-| FSM Transition | Info | State machine step: Init→2-Way→ExStart→Exchange→Loading→Full |
-| DR Election | Info | Designated Router elected |
-| Adjacency Formed | Info | DBD exchange progressing toward Full |
-| Neighbor Timeout | Warning | Dead interval exceeded, neighbor declared DOWN |
-| DR Change | Warning | DR changed mid-operation — reconvergence triggered |
-| Hello Interval Mismatch | Warning | Mismatched timers — adjacency will never form |
-| LSA Flood | Warning | Topology instability, likely a flapping link |
-| MTU Mismatch | Critical | DBD exchange stalls in ExStart — silent failure |
-| Duplicate Router-ID | Critical | LSDB corruption across the entire area |
-| Authentication Mismatch | Critical | Auth type conflict — adjacency silently rejected |
+```
+Hello seen             → Init
+Neighbor in Hello list → 2-Way
+DBD with I-flag        → ExStart
+DBD without I-flag     → Exchange
+LSU received           → Loading
+LSAck received         → Full
+```
+
+Every transition is visible in the event timeline. A state machine stuck in ExStart (MTU mismatch) or never reaching 2-Way (Hello mismatch) is immediately obvious.
+
+### Anomaly Detection
+
+| Event | Severity | Confidence | Description |
+|---|---|---|---|
+| Neighbor Up | Info | — | New router-ID seen |
+| FSM Transition | Info | — | State machine step |
+| DR Election | Info | — | Designated Router elected |
+| Adjacency Formed | Info | — | Full state reached via LSAck |
+| Neighbor Timeout | Warning | 60–95% | Dead interval exceeded |
+| DR Change | Warning | 50–90% | DR changed mid-operation |
+| Hello Mismatch | Warning | 97% | Timer mismatch — adjacency never forms |
+| LSA Flood | Warning | 55–85% | Topology instability |
+| MTU Mismatch | Critical | 70–99% | DBD exchange stalls in ExStart |
+| Duplicate Router-ID | Critical | 99% | LSDB corruption across the area |
+| Auth Mismatch | Critical | 95% | Packets silently rejected |
+
+Each detector includes a confidence score with reasoning — how many packets confirm the issue, why the confidence is high or low.
 
 ### Root Cause Analysis
 
-Beyond listing events, the tool correlates them into primary causes and secondary effects:
+Correlates events into primary causes with causal chains:
 
 ```
 [CRITICAL] MTU Mismatch — DBD exchange cannot complete
+Detection Confidence: 99% — 8 DBD packets with mismatched MTU, 7 retransmissions
 
-Impact:      OSPF adjacency stuck in ExStart. Silent failure.
-Effects:     → Adjacency never formed
-             → Routes from affected neighbor not in RIB
-Affected:    2.2.2.2
+Causal Chain:
+  +0.0s  [context] Neighbor discovered, Hello exchange successful
+  +12.5s [CAUSE]   MTU mismatch detected in DBD — 1400 vs 1500
+  +13.5s [effect]  Adjacency never reached Full state
+
+Impact:      OSPF stuck in ExStart. Silent failure — no error logged.
 Remediation: verify `show interface` MTU on both sides
-
-Action Plan:
-  1. Fix MTU mismatch — verify `show interface` on both sides
+Action Plan: Fix MTU mismatch — verify `show interface` on both sides
 ```
 
-### FSM reconstruction
+### Network Topology Graph
 
-The tool approximates the RFC 2328 neighbor state machine from packet evidence:
+Reconstructs the network topology from Router-LSA data — the same information OSPF routers use to build their routing tables. Rendered as a force-directed SVG graph with link costs.
 
-```
-Hello seen          → Init
-Neighbor in Hello   → 2-Way
-DBD with I-flag     → ExStart
-DBD without I-flag  → Exchange
-LSU received        → Loading
-LSAck / silence     → Full (inferred)
-```
+### Export
 
-Stalled state machines — e.g. stuck in ExStart due to MTU mismatch — are visible in the timeline.
+Download the full analysis as JSON (machine-readable) or plain-text post-mortem report (for tickets and incident documentation).
 
 ---
 
 ## How it works
 
 ```
-PCAP file (drag & drop)
-       │
-       ▼
-  ArrayBuffer (JS)
-       │
-       ▼
-  WASM module (Rust)
-  ├── pcap.rs       — binary PCAP parser (nom), legacy format
-  ├── net.rs        — Ethernet → IP, 802.1Q, 802.1ad (Q-in-Q)
-  ├── ospf.rs       — Hello / DBD / LSU / LSR / LSAck parsers
-  ├── analyzer.rs   — stateful FSM + event & anomaly detection
-  └── root_cause.rs — correlation engine, remediation, action plan
-       │
-       ▼
-  JSON report → JS frontend → timeline + root cause UI
+PCAP / PCAPng file (drag & drop)
+         │
+         ▼
+   ArrayBuffer (JS)
+         │
+         ▼
+   WASM module (Rust)
+   ├── pcap.rs       — legacy PCAP parser (nom), little/big endian
+   ├── pcapng.rs     — PCAPng parser (SHB/IDB/EPB/SPB/OPB blocks)
+   ├── net.rs        — Ethernet → IP, 802.1Q, 802.1ad (Q-in-Q)
+   ├── ospf.rs       — Hello/DBD/LSU/LSR/LSAck + Router-LSA body
+   ├── analyzer.rs   — stateful FSM + topology graph + event detection
+   └── root_cause.rs — correlation engine, confidence, causal chains
+         │
+         ▼
+   JSON report → JS frontend → timeline + root cause + topology
 ```
 
-Everything runs in the browser's WASM sandbox. The file never leaves your machine.
+Everything runs in the browser's WASM sandbox. The file never leaves your machine — no upload, no server, no telemetry.
 
 ---
 
@@ -102,29 +111,32 @@ Everything runs in the browser's WASM sandbox. The file never leaves your machin
 | | OSPF Post-Mortem | Wireshark | CloudShark |
 |---|---|---|---|
 | Interface | Browser, drag & drop | Desktop app | Web (cloud) |
-| OSPF FSM reconstruction | ✓ | ✗ | ✗ |
-| Root cause + remediation | ✓ | ✗ | ✗ |
-| Anomaly detection | ✓ Built-in | ✗ Manual | ✗ |
+| Full FSM reconstruction | ✓ Init→Full | ✗ | ✗ |
+| Root cause + causal chain | ✓ | ✗ | ✗ |
+| Confidence scores | ✓ | ✗ | ✗ |
+| Topology graph from LSA | ✓ | ✗ | ✗ |
 | Data leaves machine | ✗ Never | ✗ Never | ✓ Uploaded |
 | Requires install | ✗ | ✓ | ✗ |
+
+Wireshark is the right tool for deep packet inspection. This tool answers the question that comes after: *what actually happened, and why did OSPF fail?*
 
 ---
 
 ## Test dataset
 
-The repository includes reproducible OSPF anomaly scenarios with known packet sequences for each failure mode.
+Reproducible anomaly scenarios with known packet sequences for each failure mode.
 
 ```
 dataset/
-├── 01-clean-adjacency/      # baseline — 0 anomalies, full convergence
-├── 02-mtu-mismatch/         # DBD stuck in ExStart, MTU 1500 vs 1400
-├── 03-hello-mismatch/       # hello=10s vs hello=30s, never forms
-├── 04-auth-mismatch/        # MD5 vs None, silent rejection
-├── 05-duplicate-router-id/  # same RID from two IPs, LSDB corruption
+├── 01-clean-adjacency/      # baseline — 0 anomalies, full Init→Full convergence
+├── 02-mtu-mismatch/         # DBD stuck in ExStart, MTU 1500 vs 1400, confidence 99%
+├── 03-hello-mismatch/       # hello=10s vs hello=30s, never forms, confidence 97%
+├── 04-auth-mismatch/        # MD5 vs None, silent rejection, confidence 95%
+├── 05-duplicate-router-id/  # same RID from two IPs, LSDB corruption, confidence 99%
 └── 06-neighbor-flapping/    # neighbor up/down cycles, LSA flood
 ```
 
-Each scenario has a `README.md` with the expected analysis result. Use these to verify the tool or as learning material.
+Each scenario has a `README.md` with the expected analysis result. Validated against real Cisco IOS captures (2004, 2018, 2019).
 
 To regenerate:
 ```bash
@@ -151,6 +163,16 @@ make serve
 # → http://localhost:8888
 ```
 
+### Makefile
+
+```bash
+make check   # cargo check, fast iteration
+make build   # wasm-pack → web/pkg/
+make serve   # python3 HTTP server on :8888
+make dev     # build + serve
+make clean   # remove artifacts
+```
+
 ### Project structure
 
 ```
@@ -158,36 +180,27 @@ ospf-postmortem/
 ├── crates/parser/
 │   ├── Cargo.toml
 │   └── src/
-│       ├── lib.rs          # WASM entry point
-│       ├── pcap.rs         # PCAP binary parser
+│       ├── lib.rs          # WASM entry point, format autodetect
+│       ├── pcap.rs         # legacy PCAP parser
+│       ├── pcapng.rs       # PCAPng parser (all block types)
 │       ├── net.rs          # Ethernet/IP, 802.1Q, Q-in-Q
-│       ├── ospf.rs         # OSPF packet parser (all 5 types)
-│       ├── analyzer.rs     # FSM + event detection
-│       └── root_cause.rs   # Correlation + remediation
+│       ├── ospf.rs         # OSPF parser + Router-LSA body
+│       ├── analyzer.rs     # FSM + topology + event detection
+│       └── root_cause.rs   # correlation + confidence + remediation
 ├── web/
-│   ├── index.html          # Frontend (single file, no framework)
-│   └── pkg/                # Generated by wasm-pack (git-ignored)
-├── dataset/                # Test captures with known anomalies
-├── generate-dataset.py     # Dataset generator (scapy)
+│   ├── index.html          # frontend (single file, no framework)
+│   └── pkg/                # generated by wasm-pack
+├── dataset/                # test captures with known anomalies
+├── generate-dataset.py     # dataset generator (scapy)
 └── Makefile
-```
-
-### Makefile
-
-```bash
-make check   # cargo check, fast
-make build   # wasm-pack → web/pkg/
-make serve   # python3 HTTP server on :8888
-make dev     # build + serve
-make clean   # remove artifacts
 ```
 
 ---
 
 ## Limitations
 
-- Ethernet link type only
-- FSM reconstruction is approximate — inferred from packet evidence, not router internals
+- Ethernet link type only (other link types skipped)
+- FSM reconstruction is approximate — inferred from packet evidence
 - Large captures (>100MB) may be slow
 - HSRP analysis not yet implemented
 
@@ -195,10 +208,26 @@ make clean   # remove artifacts
 
 ## Roadmap
 
-- [ ] Topology graph — reconstruct network diagram from Router-LSA data
 - [ ] HSRP detection (UDP 1985) — Coup/Resign, rogue active, priority wars
-- [ ] FSM Full state via LSAck tracking
-- [ ] Convergence time measurement
+- [ ] Convergence time measurement — seconds from first Hello to Full
+- [ ] CLI version (same Rust crate, no WASM)
+
+---
+
+## Changelog
+
+**Current**
+- Full FSM: Loading→Full via LSAck tracking
+- Topology graph from Router-LSA (force-directed SVG)
+- PCAPng support (SHB/IDB/EPB/SPB/OPB)
+- 802.1ad Q-in-Q support
+- Confidence scores per detector (0–99%)
+- Causal chain visualization
+- Root cause correlator with action plan
+- Export to JSON and plain-text report
+- Dataset: 6 reproducible anomaly scenarios
+- Validated on real Cisco IOS captures (2004–2019)
+- Deployed on Cloudflare Workers
 
 ---
 
