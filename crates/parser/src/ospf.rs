@@ -157,13 +157,35 @@ impl OspfDbd {
     pub fn is_more(&self) -> bool { self.flags & 0x02 != 0 }
 }
 
+/// LSAck — список LSA хедеров подтверждений
+#[derive(Debug, Clone)]
+pub struct OspfLsAck {
+    pub header: OspfHeader,
+    pub lsa_headers: Vec<LsaHeader>,
+}
+
+/// LSR — список запросов конкретных LSA
+#[derive(Debug, Clone)]
+pub struct LsRequest {
+    pub ls_type: u32,
+    pub link_state_id: [u8; 4],
+    pub advertising_router: [u8; 4],
+}
+
+#[derive(Debug, Clone)]
+pub struct OspfLsr {
+    pub header: OspfHeader,
+    pub requests: Vec<LsRequest>,
+}
+
 /// Unified enum — результат парсинга
 #[derive(Debug, Clone)]
 pub enum OspfPacket {
     Hello(OspfHello),
     Dbd(OspfDbd),
     Lsu(OspfLsu),
-    // LSR и LSAck пока храним как raw header + данные
+    LsAck(OspfLsAck),
+    Lsr(OspfLsr),
     Other(OspfHeader),
 }
 
@@ -173,6 +195,8 @@ impl OspfPacket {
             OspfPacket::Hello(h) => &h.header,
             OspfPacket::Dbd(d) => &d.header,
             OspfPacket::Lsu(l) => &l.header,
+            OspfPacket::LsAck(a) => &a.header,
+            OspfPacket::Lsr(r) => &r.header,
             OspfPacket::Other(h) => h,
         }
     }
@@ -384,6 +408,31 @@ fn parse_lsu(header: OspfHeader, input: &[u8]) -> IResult<&[u8], OspfLsu> {
     Ok((input, OspfLsu { header, lsa_headers, router_lsas }))
 }
 
+fn parse_lsack(header: OspfHeader, input: &[u8]) -> IResult<&[u8], OspfLsAck> {
+    let mut lsa_headers = Vec::new();
+    let mut rest = input;
+    while rest.len() >= 20 {
+        match parse_lsa_header(rest) {
+            Ok((r, lsa)) => { lsa_headers.push(lsa); rest = r; }
+            Err(_) => break,
+        }
+    }
+    Ok((rest, OspfLsAck { header, lsa_headers }))
+}
+
+fn parse_lsr(header: OspfHeader, input: &[u8]) -> IResult<&[u8], OspfLsr> {
+    let mut requests = Vec::new();
+    let mut rest = input;
+    while rest.len() >= 12 {
+        let ls_type = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
+        let link_state_id = [rest[4], rest[5], rest[6], rest[7]];
+        let adv_r = [rest[8], rest[9], rest[10], rest[11]];
+        requests.push(LsRequest { ls_type, link_state_id, advertising_router: adv_r });
+        rest = &rest[12..];
+    }
+    Ok((rest, OspfLsr { header, requests }))
+}
+
 /// Главный entry point — парсим OSPF payload (после IP хедера)
 pub fn parse_ospf(input: &[u8]) -> Option<OspfPacket> {
     if input.len() < 24 { return None; }
@@ -399,6 +448,12 @@ pub fn parse_ospf(input: &[u8]) -> Option<OspfPacket> {
         }
         OspfType::LinkStateUpdate => {
             parse_lsu(header, rest).ok().map(|(_, l)| OspfPacket::Lsu(l))
+        }
+        OspfType::LinkStateAck => {
+            parse_lsack(header, rest).ok().map(|(_, a)| OspfPacket::LsAck(a))
+        }
+        OspfType::LinkStateRequest => {
+            parse_lsr(header, rest).ok().map(|(_, r)| OspfPacket::Lsr(r))
         }
         _ => Some(OspfPacket::Other(header)),
     }

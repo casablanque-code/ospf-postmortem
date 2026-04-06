@@ -264,6 +264,13 @@ impl Analyzer {
                     }
                 }
             }
+            OspfPacket::LsAck(ack) => {
+                self.process_lsack(&ack.header.router_id_str(), ts, &mut events);
+            }
+            OspfPacket::Lsr(_lsr) => {
+                // LSR — роутер запрашивает LSA, значит он в Loading state
+                // Ничего дополнительно не делаем — LSU уже перевёл в Loading
+            }
             OspfPacket::Lsu(lsu) => {
                 let rid = lsu.header.router_id_str();
                 // Извлекаем топологию из Router-LSA
@@ -485,6 +492,44 @@ impl Analyzer {
                 } // end if count == 1
             }
             _ => {}
+        }
+    }
+
+    fn process_lsack(&mut self, rid: &str, ts: Timestamp, events: &mut Vec<OspfEvent>) {
+        // LSAck от роутера в Loading state → переходим в Full
+        if let Some(nb) = self.neighbors.get_mut(rid) {
+            if nb.fsm_state == OspfNbrState::Loading {
+                let from = nb.fsm_state.as_str().to_string();
+                nb.fsm_state = OspfNbrState::Full;
+                events.push(OspfEvent::StateTransition {
+                    ts: ts.to_f64(),
+                    router_id: rid.to_string(),
+                    from_state: from,
+                    to_state: "Full".to_string(),
+                });
+                // AdjacencyFormed теперь точный — роутер достиг Full
+                let peer_rid = self.neighbors.iter()
+                    .find(|(r, _)| *r != rid)
+                    .map(|(r, _)| r.clone())
+                    .unwrap_or_else(|| rid.to_string());
+                let pair_key = {
+                    let mut pair = vec![rid.to_string(), peer_rid.clone()];
+                    pair.sort();
+                    pair.join("-")
+                };
+                if !self.adjacency_formed.contains(&pair_key) {
+                    self.adjacency_formed.insert(pair_key);
+                    let area = self.neighbors.get(rid)
+                        .map(|n| n.area.clone())
+                        .unwrap_or_default();
+                    events.push(OspfEvent::AdjacencyFormed {
+                        ts: ts.to_f64(),
+                        router_id: rid.to_string(),
+                        neighbor_id: peer_rid,
+                        area,
+                    });
+                }
+            }
         }
     }
 
