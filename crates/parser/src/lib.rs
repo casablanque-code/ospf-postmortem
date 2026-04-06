@@ -76,6 +76,9 @@ pub fn analyze_pcap(data: &[u8]) -> Result<JsValue, JsValue> {
         events.push(TimedEvent { ts: last_ts.to_f64(), event: ev, severity });
     }
 
+    // Topology graph
+    let topology = analyzer.get_topology();
+
     // Root cause correlation
     let mtu_counts = analyzer.mtu_mismatch_counts().clone();
     let root_cause_report = root_cause::correlate(&events, &mtu_counts);
@@ -110,6 +113,7 @@ pub fn analyze_pcap(data: &[u8]) -> Result<JsValue, JsValue> {
             dr_changes,
         },
         root_cause: root_cause_report,
+        topology,
     };
 
     serde_wasm_bindgen::to_value(&report).map_err(|e| JsValue::from_str(&e.to_string()))
@@ -124,6 +128,7 @@ struct FullReport {
     events: Vec<TimedEvent>,
     summary: ReportSummary,
     root_cause: root_cause::RootCauseReport,
+    topology: analyzer::TopologyGraph,
 }
 
 pub use analyzer::Timestamp;

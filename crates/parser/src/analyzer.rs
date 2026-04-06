@@ -5,6 +5,29 @@ use std::collections::HashMap;
 use crate::ospf::{OspfPacket, OspfHello, OspfDbd, ip_to_str};
 use serde::{Serialize, Deserialize};
 
+/// Нода топологии — один роутер
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TopologyNode {
+    pub router_id: String,
+    pub ip: String,
+}
+
+/// Ребро топологии — линк между роутерами
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TopologyEdge {
+    pub from: String,
+    pub to: String,
+    pub link_type: String,
+    pub metric: u16,
+}
+
+/// Граф топологии
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TopologyGraph {
+    pub nodes: Vec<TopologyNode>,
+    pub edges: Vec<TopologyEdge>,
+}
+
 /// Временная метка пакета
 #[derive(Debug, Clone, Copy)]
 pub struct Timestamp {
@@ -183,6 +206,7 @@ pub struct Analyzer {
     mtu_mismatch_count: std::collections::HashMap<String, u8>,
     auth_mismatch_seen: std::collections::HashSet<String>,
     adjacency_formed: std::collections::HashSet<String>,
+    topology_edges: Vec<(String, String, String, u16)>,
 }
 
 impl Analyzer {
@@ -197,6 +221,7 @@ impl Analyzer {
             lsu_flood_threshold: 10,
             mtu_mismatch_count: std::collections::HashMap::new(),
             adjacency_formed: std::collections::HashSet::new(),
+            topology_edges: Vec::new(),
             auth_mismatch_seen: std::collections::HashSet::new(),
         }
     }
@@ -240,7 +265,38 @@ impl Analyzer {
                 }
             }
             OspfPacket::Lsu(lsu) => {
-                self.process_lsu(&lsu.header.router_id_str(), ts, &mut events);
+                let rid = lsu.header.router_id_str();
+                // Извлекаем топологию из Router-LSA
+                for rlsa in &lsu.router_lsas {
+                    let adv = rlsa.header.advertising_router_str();
+                    for link in &rlsa.links {
+                        match link.link_type {
+                            crate::ospf::RouterLinkType::PointToPoint |
+                            crate::ospf::RouterLinkType::TransitNetwork => {
+                                let key = {
+                                    let mut pair = vec![adv.clone(), link.link_id_str()];
+                                    pair.sort();
+                                    pair.join("-")
+                                };
+                                let already = self.topology_edges.iter().any(|(f, t, _, _)| {
+                                    let mut p = vec![f.clone(), t.clone()];
+                                    p.sort();
+                                    p.join("-") == key
+                                });
+                                if !already {
+                                    self.topology_edges.push((
+                                        adv.clone(),
+                                        link.link_id_str(),
+                                        format!("{}", link.link_type),
+                                        link.metric,
+                                    ));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                self.process_lsu(&rid, ts, &mut events);
             }
             _ => {}
         }
@@ -473,6 +529,38 @@ impl Analyzer {
     /// Возвращает количество MTU mismatch DBD пакетов per router_id
     pub fn mtu_mismatch_counts(&self) -> &std::collections::HashMap<String, u8> {
         &self.mtu_mismatch_count
+    }
+
+    /// Строим финальный граф топологии
+    pub fn get_topology(&self) -> TopologyGraph {
+        let mut node_ids = std::collections::HashSet::new();
+        let mut edges = Vec::new();
+
+        for (from, to, link_type, metric) in &self.topology_edges {
+            node_ids.insert(from.clone());
+            node_ids.insert(to.clone());
+            edges.push(TopologyEdge {
+                from: from.clone(),
+                to: to.clone(),
+                link_type: link_type.clone(),
+                metric: *metric,
+            });
+        }
+
+        // Добавляем роутеры из neighbor table если нет в LSA
+        for rid in self.neighbors.keys() {
+            node_ids.insert(rid.clone());
+        }
+
+        let nodes = node_ids.into_iter().map(|rid: String| {
+            let ip = self.ip_to_rid.iter()
+                .find(|(_, r)| *r == &rid)
+                .map(|(ip, _)| ip.clone())
+                .unwrap_or_else(|| rid.clone());
+            TopologyNode { router_id: rid, ip }
+        }).collect();
+
+        TopologyGraph { nodes, edges }
     }
 
     /// Вызываем в конце — проверяем таймауты соседей

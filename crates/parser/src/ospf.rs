@@ -27,6 +27,18 @@ impl From<u8> for OspfType {
     }
 }
 
+impl std::fmt::Display for RouterLinkType {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            RouterLinkType::PointToPoint   => write!(f, "p2p"),
+            RouterLinkType::TransitNetwork => write!(f, "transit"),
+            RouterLinkType::StubNetwork    => write!(f, "stub"),
+            RouterLinkType::VirtualLink    => write!(f, "virtual"),
+            RouterLinkType::Unknown(n)     => write!(f, "unknown({})", n),
+        }
+    }
+}
+
 impl std::fmt::Display for OspfType {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
@@ -88,7 +100,7 @@ impl OspfHello {
 }
 
 /// LSA хедер (20 байт) — используется в LSU и LSAck
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LsaHeader {
     pub ls_age: u16,
     pub options: u8,
@@ -125,6 +137,7 @@ impl LsaHeader {
 pub struct OspfLsu {
     pub header: OspfHeader,
     pub lsa_headers: Vec<LsaHeader>,
+    pub router_lsas: Vec<RouterLsa>,
 }
 
 /// DBD — Database Description (для обнаружения MTU mismatch)
@@ -163,6 +176,54 @@ impl OspfPacket {
             OspfPacket::Other(h) => h,
         }
     }
+}
+
+/// Тип линка в Router-LSA (RFC 2328 §12.4.1)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum RouterLinkType {
+    PointToPoint,    // 1 — p2p линк к другому роутеру
+    TransitNetwork,  // 2 — линк к broadcast сети (через DR)
+    StubNetwork,     // 3 — stub сеть (loopback, etc)
+    VirtualLink,     // 4 — virtual link
+    Unknown(u8),
+}
+
+impl From<u8> for RouterLinkType {
+    fn from(v: u8) -> Self {
+        match v {
+            1 => RouterLinkType::PointToPoint,
+            2 => RouterLinkType::TransitNetwork,
+            3 => RouterLinkType::StubNetwork,
+            4 => RouterLinkType::VirtualLink,
+            n => RouterLinkType::Unknown(n),
+        }
+    }
+}
+
+/// Один линк из Router-LSA
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RouterLink {
+    pub link_id: [u8; 4],    // Router-ID соседа (p2p) или IP DR (transit)
+    pub link_data: [u8; 4],  // IP интерфейса или subnet mask
+    pub link_type: RouterLinkType,
+    pub metric: u16,
+}
+
+impl RouterLink {
+    pub fn link_id_str(&self) -> String {
+        crate::ospf::ip_to_str(&self.link_id)
+    }
+    pub fn link_data_str(&self) -> String {
+        crate::ospf::ip_to_str(&self.link_data)
+    }
+}
+
+/// Распарсенное тело Router-LSA
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RouterLsa {
+    pub header: LsaHeader,
+    pub flags: u8,
+    pub links: Vec<RouterLink>,
 }
 
 // ── Парсеры ──────────────────────────────────────────────────────────────────
@@ -209,6 +270,32 @@ fn parse_lsa_header(input: &[u8]) -> IResult<&[u8], LsaHeader> {
         ls_checksum: cksum,
         length,
     }))
+}
+
+/// Парсим тело Router-LSA (type 1)
+/// Структура: flags(1) + reserved(1) + num_links(2) + N * link(12)
+pub fn parse_router_lsa_body(header: LsaHeader, body: &[u8]) -> Option<RouterLsa> {
+    if body.len() < 4 { return None; }
+    let flags = body[0];
+    // body[1] reserved
+    let num_links = u16::from_be_bytes([body[2], body[3]]) as usize;
+    let mut links = Vec::new();
+    let mut pos = 4usize;
+
+    for _ in 0..num_links {
+        // Каждый линк: link_id(4) + link_data(4) + type(1) + num_tos(1) + metric(2) + TOS data
+        if pos + 12 > body.len() { break; }
+        let link_id   = [body[pos], body[pos+1], body[pos+2], body[pos+3]];
+        let link_data = [body[pos+4], body[pos+5], body[pos+6], body[pos+7]];
+        let link_type = RouterLinkType::from(body[pos+8]);
+        let num_tos   = body[pos+9] as usize;
+        let metric    = u16::from_be_bytes([body[pos+10], body[pos+11]]);
+        pos += 12 + num_tos * 4; // пропускаем TOS data
+
+        links.push(RouterLink { link_id, link_data, link_type, metric });
+    }
+
+    Some(RouterLsa { header, flags, links })
 }
 
 fn parse_hello(header: OspfHeader, input: &[u8]) -> IResult<&[u8], OspfHello> {
@@ -267,12 +354,22 @@ fn parse_lsu(header: OspfHeader, input: &[u8]) -> IResult<&[u8], OspfLsu> {
     let (mut input, num_lsas) = be_u32(input)?;
 
     let mut lsa_headers = Vec::new();
+    let mut router_lsas = Vec::new();
+
     for _ in 0..num_lsas {
         if input.len() < 20 { break; }
         match parse_lsa_header(input) {
             Ok((rest, lsa)) => {
-                // Пропускаем тело LSA (length включает 20-байтный хедер)
                 let body_len = (lsa.length as usize).saturating_sub(20);
+                let body = if rest.len() >= body_len { &rest[..body_len] } else { rest };
+
+                // Парсим тело Router-LSA (type 1)
+                if lsa.ls_type == 1 {
+                    if let Some(rlsa) = parse_router_lsa_body(lsa.clone(), body) {
+                        router_lsas.push(rlsa);
+                    }
+                }
+
                 lsa_headers.push(lsa);
                 if rest.len() >= body_len {
                     input = &rest[body_len..];
@@ -284,7 +381,7 @@ fn parse_lsu(header: OspfHeader, input: &[u8]) -> IResult<&[u8], OspfLsu> {
         }
     }
 
-    Ok((input, OspfLsu { header, lsa_headers }))
+    Ok((input, OspfLsu { header, lsa_headers, router_lsas }))
 }
 
 /// Главный entry point — парсим OSPF payload (после IP хедера)

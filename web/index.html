@@ -294,6 +294,15 @@ h1 span { color: var(--accent); }
 .export-btn { font-family: var(--mono); font-size: 11px; padding: 7px 16px; border-radius: 2px; border: 1px solid var(--border2); background: transparent; color: var(--muted); cursor: pointer; transition: all 0.15s; }
 .export-btn:hover { border-color: var(--accent); color: var(--accent); }
 
+/* topology */
+.topo-node circle { fill: var(--surface2); stroke: var(--accent); stroke-width: 1.5; }
+.topo-node text { fill: var(--text); font-family: var(--mono); font-size: 11px; }
+.topo-node .rid { fill: var(--accent); font-size: 10px; }
+.topo-edge { stroke: var(--border2); stroke-width: 1.5; }
+.topo-edge.p2p { stroke: var(--accent2); }
+.topo-edge.transit { stroke: var(--warn); opacity: 0.6; }
+.topo-metric { fill: var(--muted); font-size: 9px; font-family: var(--mono); }
+
 .empty { text-align: center; padding: 48px; color: var(--muted); font-size: 12px; }
 .empty strong { display: block; color: var(--ok); font-size: 20px; margin-bottom: 8px; font-family: var(--display); }
 
@@ -336,6 +345,24 @@ footer { margin-top: 64px; padding-top: 24px; border-top: 1px solid var(--border
           <span class="section-title" style="font-size:13px">Action Plan</span>
         </div>
         <ul class="action-plan" id="action-plan"></ul>
+      </div>
+    </div>
+
+    <!-- Topology Graph -->
+    <div id="topo-section" style="margin-bottom:48px;display:none;margin-top:8px">
+      <div class="section-head">
+        <span class="section-title">Network Topology</span>
+        <span class="section-count" id="topo-count"></span>
+      </div>
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:4px;overflow:hidden">
+        <svg id="topo-svg" width="100%" style="display:block"></svg>
+      </div>
+      <div style="font-size:11px;color:var(--muted);margin-top:10px;display:flex;gap:20px;padding:10px 14px;background:var(--surface);border:1px solid var(--border);border-radius:3px">
+        <span style="color:var(--text);font-weight:600">Legend:</span>
+        <span><svg width="12" height="12" style="vertical-align:middle"><circle cx="6" cy="6" r="5" fill="var(--surface2)" stroke="var(--accent)" stroke-width="1.5"/></svg> Router (last 2 octets of Router-ID)</span>
+        <span><svg width="20" height="3" style="vertical-align:middle"><line x1="0" y1="1.5" x2="20" y2="1.5" stroke="var(--accent2)" stroke-width="1.5"/></svg> Point-to-point link</span>
+        <span><svg width="20" height="3" style="vertical-align:middle"><line x1="0" y1="1.5" x2="20" y2="1.5" stroke="var(--warn)" stroke-width="1.5" opacity="0.6"/></svg> Transit (broadcast) link</span>
+        <span style="color:var(--muted)">cost N — OSPF interface cost (100/BW)</span>
       </div>
     </div>
 
@@ -584,6 +611,105 @@ function renderSummary(r) {
     </div>`).join('');
 }
 
+// ── Topology Graph ───────────────────────────────────────────────────────────
+
+function renderTopology(topology) {
+  const section = document.getElementById('topo-section');
+  const svg = document.getElementById('topo-svg');
+
+  if (!topology || topology.nodes.length < 2) {
+    section.style.display = 'none';
+    return;
+  }
+
+  section.style.display = 'block';
+  document.getElementById('topo-count').textContent =
+    `${topology.nodes.length} routers, ${topology.edges.length} links`;
+
+  const W = svg.parentElement.clientWidth || 800;
+  const H = Math.max(300, topology.nodes.length * 80);
+  svg.setAttribute('height', H);
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+
+  // Force-directed layout — простая версия без библиотек
+  const nodes = topology.nodes.map((n, i) => ({
+    ...n,
+    x: W/2 + Math.cos(2 * Math.PI * i / topology.nodes.length) * (Math.min(W,H) * 0.35),
+    y: H/2 + Math.sin(2 * Math.PI * i / topology.nodes.length) * (Math.min(W,H) * 0.35),
+    vx: 0, vy: 0
+  }));
+
+  const nodeMap = {};
+  nodes.forEach(n => nodeMap[n.router_id] = n);
+
+  // Симуляция — 80 итераций
+  for (let iter = 0; iter < 80; iter++) {
+    // Repulsion
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        const dx = nodes[j].x - nodes[i].x;
+        const dy = nodes[j].y - nodes[i].y;
+        const dist = Math.sqrt(dx*dx + dy*dy) || 1;
+        const force = 8000 / (dist * dist);
+        nodes[i].vx -= force * dx / dist;
+        nodes[i].vy -= force * dy / dist;
+        nodes[j].vx += force * dx / dist;
+        nodes[j].vy += force * dy / dist;
+      }
+    }
+    // Attraction along edges
+    topology.edges.forEach(e => {
+      const a = nodeMap[e.from], b = nodeMap[e.to];
+      if (!a || !b) return;
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const dist = Math.sqrt(dx*dx + dy*dy) || 1;
+      const ideal = 160;
+      const force = (dist - ideal) * 0.03;
+      a.vx += force * dx / dist; a.vy += force * dy / dist;
+      b.vx -= force * dx / dist; b.vy -= force * dy / dist;
+    });
+    // Center gravity
+    nodes.forEach(n => {
+      n.vx += (W/2 - n.x) * 0.01;
+      n.vy += (H/2 - n.y) * 0.01;
+    });
+    // Apply + damping + bounds
+    nodes.forEach(n => {
+      n.x = Math.max(60, Math.min(W-60, n.x + n.vx * 0.4));
+      n.y = Math.max(40, Math.min(H-40, n.y + n.vy * 0.4));
+      n.vx *= 0.7; n.vy *= 0.7;
+    });
+  }
+
+  // Render
+  let html = '<defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--border2)"/></marker></defs>';
+
+  // Edges
+  topology.edges.forEach(e => {
+    const a = nodeMap[e.from], b = nodeMap[e.to];
+    if (!a || !b) return;
+    const cls = e.link_type === 'p2p' ? 'p2p' : 'transit';
+    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const len = Math.sqrt(dx*dx + dy*dy) || 1;
+    const ox = -dy / len * 14, oy = dx / len * 14;
+    html += `<line class="topo-edge ${cls}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"/>`;
+    html += `<text class="topo-metric" x="${mx + ox}" y="${my + oy + 4}" text-anchor="middle">cost ${e.metric}</text>`;
+  });
+
+  // Nodes
+  nodes.forEach(n => {
+    const short = n.router_id.split('.').slice(-2).join('.');
+    html += `
+    <g class="topo-node" transform="translate(${n.x},${n.y})">
+      <circle r="22"/>
+      <text y="4" text-anchor="middle" font-weight="600" font-size="11px">${short}</text>
+    </g>`;
+  });
+
+  svg.innerHTML = html;
+}
+
 // ── Export ────────────────────────────────────────────────────────────────────
 
 function dl(blob, name) {
@@ -675,7 +801,23 @@ async function processFile(file) {
 
     statusEl.classList.remove('visible');
     renderSummary(report);
+
+    if (report.ospf_packets === 0) {
+      document.getElementById('rc-section').innerHTML = `
+        <div class="verdict-bar warning" style="opacity:1">
+          <strong>⚠ No OSPF traffic found</strong>
+          This capture contains no OSPF packets (IP protocol 89).
+          Make sure you captured on the right interface, or that OSPF is actually running.
+        </div>`;
+      document.getElementById('timeline').innerHTML =
+        '<div class="empty"><strong>No OSPF packets</strong>Nothing to analyze.</div>';
+      document.getElementById('event-count').textContent = '0 events';
+      results.classList.add('visible');
+      return;
+    }
+
     renderRootCause(report.root_cause);
+    renderTopology(report.topology);
     renderTimeline(allEvents);
     results.classList.add('visible');
   } catch (err) {
