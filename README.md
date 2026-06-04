@@ -6,7 +6,7 @@ A browser-based OSPF analyzer for network engineers. Drop a PCAP file — get a 
 
 Built in Rust compiled to WebAssembly. No server, no backend, no Node.js.
 
-**Live demo: https://ospf-postmortem.casablanque.workers.dev**
+**Live demo: https://ospf.postmortem.casablanque.com/**
 
 ---
 
