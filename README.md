@@ -1,5 +1,7 @@
 # OSPF Post-Mortem
 
+**Network Forensics Series** · Part 1 of N
+
 A browser-based OSPF analyzer for network engineers. Drop a PCAP file — get a structured event timeline, full FSM reconstruction, root cause analysis with causal chains, topology graph, and zero data leaving your machine.
 
 Built in Rust compiled to WebAssembly. No server, no backend, no Node.js.
