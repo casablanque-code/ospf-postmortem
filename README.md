@@ -1,4 +1,4 @@
-# OSPF Post-Mortem
+# ospf-postmortem
 
 **Network Forensics Series** · Part 1 of N
 
