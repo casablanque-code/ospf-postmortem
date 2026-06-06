@@ -241,4 +241,4 @@ MIT
 
 - **ospf-postmortem** — OSPF FSM reconstruction ← you are here
 - [dhcp-postmortem](https://github.com/casablanque-code/dhcp-postmortem) — DORA FSM + anomaly detection 
-- `stp-postmortem` — planned
+- [stp-postmortem](https://github.com/casablanque-code/stp-postmortem) — RSTP/PVST+ root cause analysis
