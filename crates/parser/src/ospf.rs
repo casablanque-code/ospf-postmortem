@@ -464,3 +464,308 @@ pub fn parse_ospf(input: &[u8]) -> Option<OspfPacket> {
 pub fn ip_to_str(ip: &[u8; 4]) -> String {
     format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
+    /// Build a minimal valid OSPF header (24 bytes)
+    fn ospf_header(msg_type: u8, router_id: [u8; 4], area_id: [u8; 4]) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.push(2u8);                                      // version
+        h.push(msg_type);                                 // type
+        h.extend_from_slice(&0u16.to_be_bytes());         // packet_len (placeholder)
+        h.extend_from_slice(&router_id);
+        h.extend_from_slice(&area_id);
+        h.extend_from_slice(&0u16.to_be_bytes());         // checksum
+        h.extend_from_slice(&0u16.to_be_bytes());         // auth_type
+        h.extend_from_slice(&[0u8; 8]);                   // auth_data
+        h
+    }
+
+    fn hello_body(neighbors: &[[u8; 4]]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&[255, 255, 255, 0]);         // network_mask
+        b.extend_from_slice(&10u16.to_be_bytes());        // hello_interval
+        b.push(0x02);                                     // options
+        b.push(1u8);                                      // router_priority
+        b.extend_from_slice(&40u32.to_be_bytes());        // dead_interval
+        b.extend_from_slice(&[192, 168, 1, 1]);           // DR
+        b.extend_from_slice(&[192, 168, 1, 2]);           // BDR
+        for nb in neighbors {
+            b.extend_from_slice(nb);
+        }
+        b
+    }
+
+    fn dbd_body(mtu: u16, flags: u8, seq: u32) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&mtu.to_be_bytes());
+        b.push(0x02); // options
+        b.push(flags);
+        b.extend_from_slice(&seq.to_be_bytes());
+        b
+    }
+
+    fn lsa_header_bytes(ls_type: u8, advertising_router: [u8; 4]) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.extend_from_slice(&0u16.to_be_bytes());         // ls_age
+        h.push(0x02);                                     // options
+        h.push(ls_type);
+        h.extend_from_slice(&[10, 0, 0, 1]);              // link_state_id
+        h.extend_from_slice(&advertising_router);
+        h.extend_from_slice(&1u32.to_be_bytes());         // seq
+        h.extend_from_slice(&0u16.to_be_bytes());         // checksum
+        h.extend_from_slice(&36u16.to_be_bytes());        // length
+        h
+    }
+
+    const RID_A: [u8; 4] = [1, 1, 1, 1];
+    const RID_B: [u8; 4] = [2, 2, 2, 2];
+    const AREA0: [u8; 4] = [0, 0, 0, 0];
+
+    // ── parse_ospf ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_hello_basic() {
+        let mut pkt = ospf_header(1, RID_A, AREA0);
+        pkt.extend(hello_body(&[]));
+        let result = parse_ospf(&pkt).expect("should parse");
+        match result {
+            OspfPacket::Hello(h) => {
+                assert_eq!(h.header.router_id, RID_A);
+                assert_eq!(h.hello_interval, 10);
+                assert_eq!(h.dead_interval, 40);
+                assert_eq!(h.neighbors.len(), 0);
+            }
+            _ => panic!("expected Hello"),
+        }
+    }
+
+    #[test]
+    fn test_parse_hello_with_neighbors() {
+        let mut pkt = ospf_header(1, RID_A, AREA0);
+        pkt.extend(hello_body(&[RID_B, [3, 3, 3, 3]]));
+        match parse_ospf(&pkt).unwrap() {
+            OspfPacket::Hello(h) => {
+                assert_eq!(h.neighbors.len(), 2);
+                assert_eq!(h.neighbors[0], RID_B);
+            }
+            _ => panic!("expected Hello"),
+        }
+    }
+
+    #[test]
+    fn test_parse_dbd_init_flag() {
+        let mut pkt = ospf_header(2, RID_A, AREA0);
+        pkt.extend(dbd_body(1500, 0x07, 1000)); // flags: I=1 M=1 MS=1
+        match parse_ospf(&pkt).unwrap() {
+            OspfPacket::Dbd(d) => {
+                assert_eq!(d.interface_mtu, 1500);
+                assert!(d.is_init());
+                assert!(d.is_master());
+                assert!(d.is_more());
+                assert_eq!(d.dd_sequence, 1000);
+            }
+            _ => panic!("expected DBD"),
+        }
+    }
+
+    #[test]
+    fn test_parse_dbd_mtu_mismatch_detection() {
+        let mut pkt_a = ospf_header(2, RID_A, AREA0);
+        pkt_a.extend(dbd_body(1500, 0x04, 1));
+        let mut pkt_b = ospf_header(2, RID_B, AREA0);
+        pkt_b.extend(dbd_body(1400, 0x04, 1));
+
+        let dbd_a = match parse_ospf(&pkt_a).unwrap() { OspfPacket::Dbd(d) => d, _ => panic!() };
+        let dbd_b = match parse_ospf(&pkt_b).unwrap() { OspfPacket::Dbd(d) => d, _ => panic!() };
+
+        assert_ne!(dbd_a.interface_mtu, dbd_b.interface_mtu);
+    }
+
+    #[test]
+    fn test_parse_lsack_with_headers() {
+        let mut pkt = ospf_header(5, RID_A, AREA0);
+        pkt.extend(lsa_header_bytes(1, RID_A));
+        pkt.extend(lsa_header_bytes(2, RID_B));
+        match parse_ospf(&pkt).unwrap() {
+            OspfPacket::LsAck(a) => assert_eq!(a.lsa_headers.len(), 2),
+            _ => panic!("expected LSAck"),
+        }
+    }
+
+    #[test]
+    fn test_parse_lsr() {
+        let mut pkt = ospf_header(3, RID_A, AREA0);
+        // LSR entry: ls_type(4) + link_state_id(4) + adv_router(4)
+        pkt.extend_from_slice(&1u32.to_be_bytes());
+        pkt.extend_from_slice(&[10, 0, 0, 1]);
+        pkt.extend_from_slice(&RID_B);
+        match parse_ospf(&pkt).unwrap() {
+            OspfPacket::Lsr(r) => {
+                assert_eq!(r.requests.len(), 1);
+                assert_eq!(r.requests[0].ls_type, 1);
+            }
+            _ => panic!("expected LSR"),
+        }
+    }
+
+    #[test]
+    fn test_too_short_returns_none() {
+        assert!(parse_ospf(&vec![0u8; 20]).is_none());
+    }
+
+    #[test]
+    fn test_unknown_type_returns_other() {
+        let pkt = ospf_header(99, RID_A, AREA0);
+        match parse_ospf(&pkt).unwrap() {
+            OspfPacket::Other(h) => assert!(matches!(h.msg_type, OspfType::Unknown(99))),
+            _ => panic!("expected Other"),
+        }
+    }
+
+    // ── OspfHeader helpers ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_router_id_str() {
+        let pkt = ospf_header(1, [10, 0, 0, 1], AREA0);
+        let mut body = hello_body(&[]);
+        let mut full = pkt; full.extend(body);
+        match parse_ospf(&full).unwrap() {
+            OspfPacket::Hello(h) => assert_eq!(h.header.router_id_str(), "10.0.0.1"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_area_id_str() {
+        let pkt = ospf_header(1, RID_A, [0, 0, 0, 1]);
+        let mut full = pkt; full.extend(hello_body(&[]));
+        match parse_ospf(&full).unwrap() {
+            OspfPacket::Hello(h) => assert_eq!(h.header.area_id_str(), "0.0.0.1"),
+            _ => panic!(),
+        }
+    }
+
+    // ── OspfType ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_ospf_type_from_u8() {
+        assert_eq!(OspfType::from(1), OspfType::Hello);
+        assert_eq!(OspfType::from(2), OspfType::DatabaseDescription);
+        assert_eq!(OspfType::from(3), OspfType::LinkStateRequest);
+        assert_eq!(OspfType::from(4), OspfType::LinkStateUpdate);
+        assert_eq!(OspfType::from(5), OspfType::LinkStateAck);
+        assert!(matches!(OspfType::from(99), OspfType::Unknown(99)));
+    }
+
+    #[test]
+    fn test_ospf_type_display() {
+        assert_eq!(format!("{}", OspfType::Hello), "Hello");
+        assert_eq!(format!("{}", OspfType::DatabaseDescription), "DBD");
+        assert_eq!(format!("{}", OspfType::Unknown(7)), "Unknown(7)");
+    }
+
+    // ── LsaHeader ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_lsa_header_type_str() {
+        let h_bytes = lsa_header_bytes(1, RID_A);
+        let (_, lsa) = super::parse_lsa_header(&h_bytes).unwrap();
+        assert_eq!(lsa.ls_type_str(), "Router-LSA");
+        assert_eq!(lsa.advertising_router_str(), "1.1.1.1");
+    }
+
+    #[test]
+    fn test_lsa_type_strings() {
+        for (t, expected) in [
+            (1u8, "Router-LSA"),
+            (2,   "Network-LSA"),
+            (3,   "Summary-LSA (Network)"),
+            (5,   "AS-External-LSA"),
+        ] {
+            let h_bytes = lsa_header_bytes(t, RID_A);
+            let (_, lsa) = super::parse_lsa_header(&h_bytes).unwrap();
+            assert_eq!(lsa.ls_type_str(), expected);
+        }
+    }
+
+    // ── OspfDbd flags ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dbd_flags() {
+        let mut pkt = ospf_header(2, RID_A, AREA0);
+        pkt.extend(dbd_body(1500, 0x00, 42));
+        match parse_ospf(&pkt).unwrap() {
+            OspfPacket::Dbd(d) => {
+                assert!(!d.is_init());
+                assert!(!d.is_master());
+                assert!(!d.is_more());
+            }
+            _ => panic!(),
+        }
+    }
+
+    // ── Router-LSA body ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_router_lsa_body_single_link() {
+        let header = LsaHeader {
+            ls_age: 0, options: 0, ls_type: 1,
+            link_state_id: [10, 0, 0, 1],
+            advertising_router: RID_A,
+            ls_seq_number: 1, ls_checksum: 0, length: 36,
+        };
+        let mut body = vec![0u8, 0u8, 0u8, 1u8]; // flags=0, reserved=0, num_links=1
+        body.extend_from_slice(&[2, 2, 2, 2]);    // link_id
+        body.extend_from_slice(&[10, 0, 0, 1]);   // link_data
+        body.push(1);                             // type: p2p
+        body.push(0);                             // num_tos
+        body.extend_from_slice(&10u16.to_be_bytes()); // metric
+        let lsa = parse_router_lsa_body(header, &body).expect("should parse");
+        assert_eq!(lsa.links.len(), 1);
+        assert_eq!(lsa.links[0].metric, 10);
+        assert!(matches!(lsa.links[0].link_type, RouterLinkType::PointToPoint));
+        assert_eq!(lsa.links[0].link_id_str(), "2.2.2.2");
+    }
+
+    #[test]
+    fn test_parse_router_lsa_body_too_short() {
+        let header = LsaHeader {
+            ls_age: 0, options: 0, ls_type: 1,
+            link_state_id: [0;4], advertising_router: RID_A,
+            ls_seq_number: 0, ls_checksum: 0, length: 20,
+        };
+        assert!(parse_router_lsa_body(header, &[0u8; 2]).is_none());
+    }
+
+    // ── RouterLinkType ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_router_link_type_from_u8() {
+        assert!(matches!(RouterLinkType::from(1), RouterLinkType::PointToPoint));
+        assert!(matches!(RouterLinkType::from(2), RouterLinkType::TransitNetwork));
+        assert!(matches!(RouterLinkType::from(3), RouterLinkType::StubNetwork));
+        assert!(matches!(RouterLinkType::from(4), RouterLinkType::VirtualLink));
+        assert!(matches!(RouterLinkType::from(99), RouterLinkType::Unknown(99)));
+    }
+
+    #[test]
+    fn test_router_link_type_display() {
+        assert_eq!(format!("{}", RouterLinkType::PointToPoint), "p2p");
+        assert_eq!(format!("{}", RouterLinkType::TransitNetwork), "transit");
+        assert_eq!(format!("{}", RouterLinkType::StubNetwork), "stub");
+    }
+
+    // ── ip_to_str ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_ip_to_str() {
+        assert_eq!(ip_to_str(&[10, 0, 0, 1]),       "10.0.0.1");
+        assert_eq!(ip_to_str(&[0, 0, 0, 0]),         "0.0.0.0");
+        assert_eq!(ip_to_str(&[255, 255, 255, 255]), "255.255.255.255");
+    }
+}
